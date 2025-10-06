@@ -35,31 +35,40 @@ def create_app():
 
     @app.get("/dissociate/terms/<term_a>/<term_b>", endpoint="dissociate_terms")
     def dissociate_by_terms(term_a, term_b):
-        """Returns studies that mention term_a but NOT term_b"""
+        """
+        Returns studies that mention term_a but NOT term_b
+        Uses Full Text Search on metadata
+        """
         try:
             eng = get_engine()
             with eng.begin() as conn:
                 conn.execute(text("SET search_path TO ns, public;"))
                 
+                # Use FTS to search metadata for studies containing term_a but not term_b
                 query = text("""
-                    SELECT DISTINCT a1.study_id
-                    FROM ns.annotations_terms a1
-                    WHERE a1.term = :term_a
-                    AND a1.study_id NOT IN (
+                    SELECT DISTINCT m1.study_id, m1.title
+                    FROM ns.metadata m1
+                    WHERE m1.fts @@ to_tsquery('english', :term_a)
+                    AND m1.study_id NOT IN (
                         SELECT study_id 
-                        FROM ns.annotations_terms 
-                        WHERE term = :term_b
+                        FROM ns.metadata 
+                        WHERE fts @@ to_tsquery('english', :term_b)
                     )
-                    ORDER BY a1.study_id
+                    ORDER BY m1.study_id
                     LIMIT 100
                 """)
                 
                 result = conn.execute(query, {
-                    "term_a": term_a,
-                    "term_b": term_b
+                    "term_a": term_a.replace("_", " & "),
+                    "term_b": term_b.replace("_", " & ")
                 })
                 
-                studies = [row[0] for row in result]
+                studies = []
+                for row in result:
+                    studies.append({
+                        "study_id": row[0],
+                        "title": row[1]
+                    })
                 
                 return jsonify({
                     "term_a": term_a,
@@ -79,44 +88,41 @@ def create_app():
     def dissociate_by_coordinates(coords_a, coords_b):
         """
         Returns studies near coords_a but NOT near coords_b
-        Optional query parameter: r=radius (default 20mm)
-        Example: /dissociate/locations/0_-52_26/-2_50_-6?r=15
+        Supports optional radius parameter (default: 10mm)
+        Usage: /dissociate/locations/x_y_z/x_y_z?radius=15
         """
         try:
             x1, y1, z1 = map(float, coords_a.split("_"))
             x2, y2, z2 = map(float, coords_b.split("_"))
             
-            # Get radius from query parameter, default to 20mm
-            radius = float(request.args.get('r', 20.0))
+            # Get radius from query parameter, default to 10mm
+            radius = float(request.args.get('radius', 10.0))
             
             eng = get_engine()
             with eng.begin() as conn:
                 conn.execute(text("SET search_path TO ns, public;"))
                 
-                # Query uses 3D Euclidean distance
+                # Use spherical distance calculation
                 query = text("""
                     SELECT DISTINCT c1.study_id,
                            ST_X(c1.geom) as x,
                            ST_Y(c1.geom) as y,
                            ST_Z(c1.geom) as z,
-                           SQRT(
-                               POWER(ST_X(c1.geom) - :x1, 2) + 
-                               POWER(ST_Y(c1.geom) - :y1, 2) + 
-                               POWER(ST_Z(c1.geom) - :z1, 2)
+                           ST_3DDistance(
+                               c1.geom,
+                               ST_SetSRID(ST_MakePoint(:x1, :y1, :z1), 4326)
                            ) as distance_a
                     FROM ns.coordinates c1
-                    WHERE SQRT(
-                        POWER(ST_X(c1.geom) - :x1, 2) + 
-                        POWER(ST_Y(c1.geom) - :y1, 2) + 
-                        POWER(ST_Z(c1.geom) - :z1, 2)
+                    WHERE ST_3DDistance(
+                        c1.geom,
+                        ST_SetSRID(ST_MakePoint(:x1, :y1, :z1), 4326)
                     ) <= :radius
                     AND c1.study_id NOT IN (
                         SELECT study_id
                         FROM ns.coordinates
-                        WHERE SQRT(
-                            POWER(ST_X(geom) - :x2, 2) + 
-                            POWER(ST_Y(geom) - :y2, 2) + 
-                            POWER(ST_Z(geom) - :z2, 2)
+                        WHERE ST_3DDistance(
+                            geom,
+                            ST_SetSRID(ST_MakePoint(:x2, :y2, :z2), 4326)
                         ) <= :radius
                     )
                     ORDER BY distance_a
@@ -147,9 +153,9 @@ def create_app():
                     "studies": studies
                 }), 200
                 
-        except ValueError as ve:
+        except ValueError:
             return jsonify({
-                "error": "Invalid format. Use x_y_z with numbers",
+                "error": "Invalid coordinate format. Use x_y_z with numbers",
                 "coords_a": coords_a,
                 "coords_b": coords_b
             }), 400
