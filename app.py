@@ -14,7 +14,6 @@ def get_engine():
     db_url = os.getenv("DB_URL")
     if not db_url:
         raise RuntimeError("Missing DB_URL (or DATABASE_URL) environment variable.")
-    # Normalize old 'postgres://' scheme to 'postgresql://'
     if db_url.startswith("postgres://"):
         db_url = "postgresql://" + db_url[len("postgres://"):]
     _engine = create_engine(
@@ -34,12 +33,36 @@ def create_app():
     def show_img():
         return send_file("amygdala.gif", mimetype="image/gif")
 
-    # NEW: Dissociate by terms endpoint
+    # Helper endpoint to explore terms
+    @app.get("/terms", endpoint="list_terms")
+    def list_terms():
+        """List available terms in the database"""
+        try:
+            eng = get_engine()
+            with eng.begin() as conn:
+                conn.execute(text("SET search_path TO ns, public;"))
+                
+                query = text("""
+                    SELECT DISTINCT term 
+                    FROM ns.annotations_terms 
+                    ORDER BY term 
+                    LIMIT 50
+                """)
+                
+                result = conn.execute(query)
+                terms = [row[0] for row in result]
+                
+                return jsonify({
+                    "count": len(terms),
+                    "terms": terms
+                }), 200
+                
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     @app.get("/dissociate/terms/<term_a>/<term_b>", endpoint="dissociate_terms")
     def dissociate_by_terms(term_a, term_b):
-        """
-        Returns studies that mention term_a but NOT term_b
-        """
+        """Returns studies that mention term_a but NOT term_b"""
         try:
             eng = get_engine()
             with eng.begin() as conn:
@@ -79,12 +102,9 @@ def create_app():
                 "term_b": term_b
             }), 500
 
-    # NEW: Dissociate by coordinates endpoint
     @app.get("/dissociate/locations/<coords_a>/<coords_b>", endpoint="dissociate_locations")
     def dissociate_by_coordinates(coords_a, coords_b):
-        """
-        Returns studies near coords_a but NOT near coords_b
-        """
+        """Returns studies near coords_a but NOT near coords_b"""
         try:
             x1, y1, z1 = map(float, coords_a.split("_"))
             x2, y2, z2 = map(float, coords_b.split("_"))
