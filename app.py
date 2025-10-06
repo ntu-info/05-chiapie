@@ -1,5 +1,5 @@
 # app.py
-from flask import Flask, jsonify, abort, send_file
+from flask import Flask, jsonify, abort, send_file, request
 import os
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
@@ -32,33 +32,6 @@ def create_app():
     @app.get("/img", endpoint="show_img")
     def show_img():
         return send_file("amygdala.gif", mimetype="image/gif")
-
-    # Helper endpoint to explore terms
-    @app.get("/terms", endpoint="list_terms")
-    def list_terms():
-        """List available terms in the database"""
-        try:
-            eng = get_engine()
-            with eng.begin() as conn:
-                conn.execute(text("SET search_path TO ns, public;"))
-                
-                query = text("""
-                    SELECT DISTINCT term 
-                    FROM ns.annotations_terms 
-                    ORDER BY term 
-                    LIMIT 50
-                """)
-                
-                result = conn.execute(query)
-                terms = [row[0] for row in result]
-                
-                return jsonify({
-                    "count": len(terms),
-                    "terms": terms
-                }), 200
-                
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
 
     @app.get("/dissociate/terms/<term_a>/<term_b>", endpoint="dissociate_terms")
     def dissociate_by_terms(term_a, term_b):
@@ -104,38 +77,47 @@ def create_app():
 
     @app.get("/dissociate/locations/<coords_a>/<coords_b>", endpoint="dissociate_locations")
     def dissociate_by_coordinates(coords_a, coords_b):
-        """Returns studies near coords_a but NOT near coords_b"""
+        """
+        Returns studies near coords_a but NOT near coords_b
+        Optional query parameter: r=radius (default 20mm)
+        Example: /dissociate/locations/0_-52_26/-2_50_-6?r=15
+        """
         try:
             x1, y1, z1 = map(float, coords_a.split("_"))
             x2, y2, z2 = map(float, coords_b.split("_"))
             
-            threshold = 10.0
+            # Get radius from query parameter, default to 20mm
+            radius = float(request.args.get('r', 20.0))
             
             eng = get_engine()
             with eng.begin() as conn:
                 conn.execute(text("SET search_path TO ns, public;"))
                 
+                # Query uses 3D Euclidean distance
                 query = text("""
                     SELECT DISTINCT c1.study_id,
                            ST_X(c1.geom) as x,
                            ST_Y(c1.geom) as y,
                            ST_Z(c1.geom) as z,
-                           ST_Distance(
-                               c1.geom,
-                               ST_SetSRID(ST_MakePoint(:x1, :y1, :z1), 4326)
+                           SQRT(
+                               POWER(ST_X(c1.geom) - :x1, 2) + 
+                               POWER(ST_Y(c1.geom) - :y1, 2) + 
+                               POWER(ST_Z(c1.geom) - :z1, 2)
                            ) as distance_a
                     FROM ns.coordinates c1
-                    WHERE ST_Distance(
-                        c1.geom,
-                        ST_SetSRID(ST_MakePoint(:x1, :y1, :z1), 4326)
-                    ) <= :threshold
+                    WHERE SQRT(
+                        POWER(ST_X(c1.geom) - :x1, 2) + 
+                        POWER(ST_Y(c1.geom) - :y1, 2) + 
+                        POWER(ST_Z(c1.geom) - :z1, 2)
+                    ) <= :radius
                     AND c1.study_id NOT IN (
                         SELECT study_id
                         FROM ns.coordinates
-                        WHERE ST_Distance(
-                            geom,
-                            ST_SetSRID(ST_MakePoint(:x2, :y2, :z2), 4326)
-                        ) <= :threshold
+                        WHERE SQRT(
+                            POWER(ST_X(geom) - :x2, 2) + 
+                            POWER(ST_Y(geom) - :y2, 2) + 
+                            POWER(ST_Z(geom) - :z2, 2)
+                        ) <= :radius
                     )
                     ORDER BY distance_a
                     LIMIT 100
@@ -144,7 +126,7 @@ def create_app():
                 result = conn.execute(query, {
                     "x1": x1, "y1": y1, "z1": z1,
                     "x2": x2, "y2": y2, "z2": z2,
-                    "threshold": threshold
+                    "radius": radius
                 })
                 
                 studies = []
@@ -160,14 +142,14 @@ def create_app():
                 return jsonify({
                     "coords_a": [x1, y1, z1],
                     "coords_b": [x2, y2, z2],
-                    "threshold_mm": threshold,
+                    "radius_mm": radius,
                     "count": len(studies),
                     "studies": studies
                 }), 200
                 
-        except ValueError:
+        except ValueError as ve:
             return jsonify({
-                "error": "Invalid coordinate format. Use x_y_z with numbers",
+                "error": "Invalid format. Use x_y_z with numbers",
                 "coords_a": coords_a,
                 "coords_b": coords_b
             }), 400
