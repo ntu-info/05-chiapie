@@ -1,214 +1,312 @@
-# app.py
-from flask import Flask, jsonify, abort, send_file, request
 import os
+from flask import Flask, jsonify, request
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.pool import NullPool
 
-_engine = None
+app = Flask(__name__)
 
+# Database configuration
 def get_engine():
-    global _engine
-    if _engine is not None:
-        return _engine
-    db_url = os.getenv("DB_URL")
+    """Create SQLAlchemy engine from environment variable"""
+    db_url = os.environ.get('postgresql://neurosynth_backend_user:ARs3Ha51JCRJKmUULGA4VwoqqQY0cuUe@dpg-d3hoecp5pdvs73feejo0-a.oregon-postgres.render.com:5432/neurosynth_backend')
     if not db_url:
-        raise RuntimeError("Missing DB_URL (or DATABASE_URL) environment variable.")
-    if db_url.startswith("postgres://"):
-        db_url = "postgresql://" + db_url[len("postgres://"):]
-    _engine = create_engine(
-        db_url,
-        pool_pre_ping=True,
-    )
-    return _engine
+        raise ValueError("DB_URL environment variable not set")
+    return create_engine(db_url, poolclass=NullPool)
 
-def create_app():
-    app = Flask(__name__)
+@app.route('/')
+def home():
+    """API documentation endpoint"""
+    return jsonify({
+        "service": "Neurosynth Dissociation API",
+        "version": "1.0",
+        "endpoints": {
+            "dissociate_terms": {
+                "path": "/dissociate/terms/<term_a>/<term_b>",
+                "method": "GET",
+                "description": "Returns studies mentioning term_a but NOT term_b",
+                "parameters": {
+                    "format": "Optional query param: 'html' for HTML table view"
+                },
+                "example": "/dissociate/terms/posterior_cingulate/ventromedial_prefrontal"
+            },
+            "dissociate_locations": {
+                "path": "/dissociate/locations/<coords_a>/<coords_b>",
+                "method": "GET",
+                "description": "Returns studies near coords_a but NOT near coords_b",
+                "parameters": {
+                    "format": "Optional query param: 'html' for HTML table view",
+                    "threshold": "Optional query param: distance threshold in mm (default: 10)"
+                },
+                "example": "/dissociate/locations/0_-52_26/-2_50_-6"
+            }
+        }
+    }), 200
 
-    @app.get("/", endpoint="health")
-    def health():
-        return "<p>Server working!</p>"
-
-    @app.get("/img", endpoint="show_img")
-    def show_img():
-        return send_file("amygdala.gif", mimetype="image/gif")
-
-    @app.get("/dissociate/terms/<term_a>/<term_b>", endpoint="dissociate_terms")
-    def dissociate_by_terms(term_a, term_b):
-        """
-        Returns studies that mention term_a but NOT term_b
-        Uses Full Text Search on metadata
-        """
-        try:
-            eng = get_engine()
-            with eng.begin() as conn:
-                conn.execute(text("SET search_path TO ns, public;"))
-                
-                # Use FTS to search metadata for studies containing term_a but not term_b
-                query = text("""
-                    SELECT DISTINCT m1.study_id, m1.title
-                    FROM ns.metadata m1
-                    WHERE m1.fts @@ to_tsquery('english', :term_a)
-                    AND m1.study_id NOT IN (
-                        SELECT study_id 
-                        FROM ns.metadata 
-                        WHERE fts @@ to_tsquery('english', :term_b)
-                    )
-                    ORDER BY m1.study_id
-                    LIMIT 100
-                """)
-                
-                result = conn.execute(query, {
-                    "term_a": term_a.replace("_", " & "),
-                    "term_b": term_b.replace("_", " & ")
-                })
-                
-                studies = []
-                for row in result:
-                    studies.append({
-                        "study_id": row[0],
-                        "title": row[1]
-                    })
-                
-                return jsonify({
-                    "term_a": term_a,
-                    "term_b": term_b,
-                    "count": len(studies),
-                    "studies": studies
-                }), 200
-                
-        except Exception as e:
-            return jsonify({
-                "error": str(e),
+@app.route('/dissociate/terms/<term_a>/<term_b>')
+def dissociate_by_terms(term_a, term_b):
+    """Returns studies that mention term_a but NOT term_b"""
+    try:
+        eng = get_engine()
+        with eng.begin() as conn:
+            conn.execute(text("SET search_path TO ns, public;"))
+            
+            query = text("""
+                SELECT DISTINCT a1.study_id, m.title
+                FROM ns.annotations_terms a1
+                LEFT JOIN ns.metadata m ON a1.study_id = m.study_id
+                WHERE a1.term = :term_a
+                AND a1.study_id NOT IN (
+                    SELECT study_id 
+                    FROM ns.annotations_terms 
+                    WHERE term = :term_b
+                )
+                ORDER BY a1.study_id
+                LIMIT 100
+            """)
+            
+            result = conn.execute(query, {
                 "term_a": term_a,
                 "term_b": term_b
-            }), 500
-
-    @app.get("/dissociate/locations/<coords_a>/<coords_b>", endpoint="dissociate_locations")
-    def dissociate_by_coordinates(coords_a, coords_b):
-        """
-        Returns studies near coords_a but NOT near coords_b
-        Supports optional radius parameter (default: 10mm)
-        Usage: /dissociate/locations/x_y_z/x_y_z?radius=15
-        """
-        try:
-            x1, y1, z1 = map(float, coords_a.split("_"))
-            x2, y2, z2 = map(float, coords_b.split("_"))
+            })
             
-            # Get radius from query parameter, default to 10mm
-            radius = float(request.args.get('radius', 10.0))
-            
-            eng = get_engine()
-            with eng.begin() as conn:
-                conn.execute(text("SET search_path TO ns, public;"))
-                
-                # Use spherical distance calculation
-                query = text("""
-                    SELECT DISTINCT c1.study_id,
-                           ST_X(c1.geom) as x,
-                           ST_Y(c1.geom) as y,
-                           ST_Z(c1.geom) as z,
-                           ST_3DDistance(
-                               c1.geom,
-                               ST_SetSRID(ST_MakePoint(:x1, :y1, :z1), 4326)
-                           ) as distance_a
-                    FROM ns.coordinates c1
-                    WHERE ST_3DDistance(
-                        c1.geom,
-                        ST_SetSRID(ST_MakePoint(:x1, :y1, :z1), 4326)
-                    ) <= :radius
-                    AND c1.study_id NOT IN (
-                        SELECT study_id
-                        FROM ns.coordinates
-                        WHERE ST_3DDistance(
-                            geom,
-                            ST_SetSRID(ST_MakePoint(:x2, :y2, :z2), 4326)
-                        ) <= :radius
-                    )
-                    ORDER BY distance_a
-                    LIMIT 100
-                """)
-                
-                result = conn.execute(query, {
-                    "x1": x1, "y1": y1, "z1": z1,
-                    "x2": x2, "y2": y2, "z2": z2,
-                    "radius": radius
+            studies = []
+            for row in result:
+                studies.append({
+                    "study_id": row[0],
+                    "title": row[1] if row[1] else "N/A"
                 })
-                
-                studies = []
-                for row in result:
-                    studies.append({
-                        "study_id": row[0],
-                        "x": float(row[1]),
-                        "y": float(row[2]),
-                        "z": float(row[3]),
-                        "distance_from_a": float(row[4])
-                    })
-                
-                return jsonify({
-                    "coords_a": [x1, y1, z1],
-                    "coords_b": [x2, y2, z2],
-                    "radius_mm": radius,
-                    "count": len(studies),
-                    "studies": studies
-                }), 200
-                
-        except ValueError:
+            
+            # Check if HTML format is requested
+            if request.args.get('format') == 'html':
+                html = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Dissociation Results: {term_a} \ {term_b}</title>
+                    <style>
+                        body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }}
+                        .container {{ max-width: 1200px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                        h2 {{ color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }}
+                        table {{ border-collapse: collapse; width: 100%; margin-top: 20px; }}
+                        th {{ background-color: #4CAF50; color: white; padding: 12px; text-align: left; position: sticky; top: 0; }}
+                        td {{ border: 1px solid #ddd; padding: 8px; }}
+                        tr:nth-child(even) {{ background-color: #f2f2f2; }}
+                        tr:hover {{ background-color: #e0e0e0; }}
+                        .info {{ margin-bottom: 20px; padding: 15px; background-color: #e7f3fe; border-left: 6px solid #2196F3; border-radius: 4px; }}
+                        .info strong {{ color: #1976D2; }}
+                        .title-cell {{ max-width: 600px; word-wrap: break-word; }}
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h2>Term Dissociation Results</h2>
+                        <div class="info">
+                            <strong>Studies with:</strong> {term_a}<br>
+                            <strong>But NOT with:</strong> {term_b}<br>
+                            <strong>Total Studies Found:</strong> {len(studies)}<br>
+                            <strong>Limit:</strong> 100 studies
+                        </div>
+                        <table>
+                            <tr>
+                                <th style="width: 50px;">#</th>
+                                <th style="width: 150px;">Study ID</th>
+                                <th>Title</th>
+                            </tr>
+                """
+                for i, study in enumerate(studies, 1):
+                    title = study['title'].replace('<', '&lt;').replace('>', '&gt;')
+                    html += f"""
+                            <tr>
+                                <td>{i}</td>
+                                <td>{study['study_id']}</td>
+                                <td class="title-cell">{title}</td>
+                            </tr>
+                    """
+                html += """
+                        </table>
+                    </div>
+                </body>
+                </html>
+                """
+                return html
+            
+            # Default JSON response
             return jsonify({
-                "error": "Invalid coordinate format. Use x_y_z with numbers",
-                "coords_a": coords_a,
-                "coords_b": coords_b
-            }), 400
-        except Exception as e:
-            return jsonify({
-                "error": str(e),
-                "coords_a": coords_a,
-                "coords_b": coords_b
-            }), 500
+                "term_a": term_a,
+                "term_b": term_b,
+                "description": f"Studies mentioning '{term_a}' but NOT '{term_b}'",
+                "count": len(studies),
+                "limit": 100,
+                "studies": studies
+            }), 200
+            
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "term_a": term_a,
+            "term_b": term_b
+        }), 500
 
-    @app.get("/test_db", endpoint="test_db")
-    def test_db():
+@app.route('/dissociate/locations/<coords_a>/<coords_b>')
+def dissociate_by_coordinates(coords_a, coords_b):
+    """Returns studies near coords_a but NOT near coords_b"""
+    try:
+        # Parse coordinates
+        x1, y1, z1 = map(float, coords_a.split("_"))
+        x2, y2, z2 = map(float, coords_b.split("_"))
+        
+        # Get threshold from query params or use default
+        threshold = float(request.args.get('threshold', 10.0))
+        
         eng = get_engine()
-        payload = {"ok": False, "dialect": eng.dialect.name}
+        with eng.begin() as conn:
+            conn.execute(text("SET search_path TO ns, public;"))
+            
+            query = text("""
+                SELECT DISTINCT c1.study_id,
+                       ST_X(c1.geom) as x,
+                       ST_Y(c1.geom) as y,
+                       ST_Z(c1.geom) as z,
+                       ST_Distance(
+                           c1.geom,
+                           ST_SetSRID(ST_MakePoint(:x1, :y1, :z1), 4326)
+                       ) as distance_a
+                FROM ns.coordinates c1
+                WHERE ST_Distance(
+                    c1.geom,
+                    ST_SetSRID(ST_MakePoint(:x1, :y1, :z1), 4326)
+                ) <= :threshold
+                AND c1.study_id NOT IN (
+                    SELECT study_id
+                    FROM ns.coordinates
+                    WHERE ST_Distance(
+                        geom,
+                        ST_SetSRID(ST_MakePoint(:x2, :y2, :z2), 4326)
+                    ) <= :threshold
+                )
+                ORDER BY distance_a
+                LIMIT 100
+            """)
+            
+            result = conn.execute(query, {
+                "x1": x1, "y1": y1, "z1": z1,
+                "x2": x2, "y2": y2, "z2": z2,
+                "threshold": threshold
+            })
+            
+            studies = []
+            for row in result:
+                studies.append({
+                    "study_id": row[0],
+                    "coordinates": {
+                        "x": round(float(row[1]), 2),
+                        "y": round(float(row[2]), 2),
+                        "z": round(float(row[3]), 2)
+                    },
+                    "distance_from_a_mm": round(float(row[4]), 2)
+                })
+            
+            # Check if HTML format is requested
+            if request.args.get('format') == 'html':
+                html = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Location Dissociation Results</title>
+                    <style>
+                        body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }}
+                        .container {{ max-width: 1000px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                        h2 {{ color: #333; border-bottom: 3px solid #2196F3; padding-bottom: 10px; }}
+                        table {{ border-collapse: collapse; width: 100%; margin-top: 20px; }}
+                        th {{ background-color: #2196F3; color: white; padding: 12px; text-align: left; position: sticky; top: 0; }}
+                        td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
+                        tr:nth-child(even) {{ background-color: #f2f2f2; }}
+                        tr:hover {{ background-color: #e0e0e0; }}
+                        .info {{ margin-bottom: 20px; padding: 15px; background-color: #e7f3fe; border-left: 6px solid #2196F3; border-radius: 4px; }}
+                        .info strong {{ color: #1565C0; }}
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h2>Location Dissociation Results</h2>
+                        <div class="info">
+                            <strong>Studies near coordinates A:</strong> ({x1}, {y1}, {z1})<br>
+                            <strong>But NOT near coordinates B:</strong> ({x2}, {y2}, {z2})<br>
+                            <strong>Distance Threshold:</strong> {threshold} mm<br>
+                            <strong>Total Studies Found:</strong> {len(studies)}<br>
+                            <strong>Limit:</strong> 100 studies
+                        </div>
+                        <table>
+                            <tr>
+                                <th style="width: 50px;">#</th>
+                                <th>Study ID</th>
+                                <th>X</th>
+                                <th>Y</th>
+                                <th>Z</th>
+                                <th>Distance (mm)</th>
+                            </tr>
+                """
+                for i, study in enumerate(studies, 1):
+                    coords = study['coordinates']
+                    html += f"""
+                            <tr>
+                                <td>{i}</td>
+                                <td>{study['study_id']}</td>
+                                <td>{coords['x']:.1f}</td>
+                                <td>{coords['y']:.1f}</td>
+                                <td>{coords['z']:.1f}</td>
+                                <td>{study['distance_from_a_mm']:.2f}</td>
+                            </tr>
+                    """
+                html += """
+                        </table>
+                    </div>
+                </body>
+                </html>
+                """
+                return html
+            
+            # Default JSON response
+            return jsonify({
+                "coords_a": {"x": x1, "y": y1, "z": z1},
+                "coords_b": {"x": x2, "y": y2, "z": z2},
+                "description": f"Studies near A but NOT near B",
+                "threshold_mm": threshold,
+                "count": len(studies),
+                "limit": 100,
+                "studies": studies
+            }), 200
+            
+    except ValueError:
+        return jsonify({
+            "error": "Invalid coordinate format. Use x_y_z with numeric values",
+            "example": "0_-52_26",
+            "coords_a": coords_a,
+            "coords_b": coords_b
+        }), 400
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "coords_a": coords_a,
+            "coords_b": coords_b
+        }), 500
 
-        try:
-            with eng.begin() as conn:
-                conn.execute(text("SET search_path TO ns, public;"))
-                payload["version"] = conn.exec_driver_sql("SELECT version()").scalar()
+@app.errorhandler(404)
+def not_found(error):
+    """Handle 404 errors"""
+    return jsonify({
+        "error": "Endpoint not found",
+        "message": "Visit / for API documentation"
+    }), 404
 
-                payload["coordinates_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.coordinates")).scalar()
-                payload["metadata_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.metadata")).scalar()
-                payload["annotations_terms_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.annotations_terms")).scalar()
+@app.errorhandler(500)
+def internal_error(error):
+    """Handle 500 errors"""
+    return jsonify({
+        "error": "Internal server error",
+        "message": str(error)
+    }), 500
 
-                try:
-                    rows = conn.execute(text(
-                        "SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z FROM ns.coordinates LIMIT 3"
-                    )).mappings().all()
-                    payload["coordinates_sample"] = [dict(r) for r in rows]
-                except Exception:
-                    payload["coordinates_sample"] = []
-
-                try:
-                    rows = conn.execute(text("SELECT * FROM ns.metadata LIMIT 3")).mappings().all()
-                    payload["metadata_sample"] = [dict(r) for r in rows]
-                except Exception:
-                    payload["metadata_sample"] = []
-
-                try:
-                    rows = conn.execute(text(
-                        "SELECT study_id, contrast_id, term, weight FROM ns.annotations_terms LIMIT 3"
-                    )).mappings().all()
-                    payload["annotations_terms_sample"] = [dict(r) for r in rows]
-                except Exception:
-                    payload["annotations_terms_sample"] = []
-
-            payload["ok"] = True
-            return jsonify(payload), 200
-
-        except Exception as e:
-            payload["error"] = str(e)
-            return jsonify(payload), 500
-
-    return app
-
-app = create_app()
+if __name__ == '__main__':
+    # Development server only
+    app.run(debug=True, host='0.0.0.0', port=5000)
