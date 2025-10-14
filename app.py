@@ -87,234 +87,48 @@ def create_app():
     def test_db():
         """Test database connectivity and show sample data"""
         eng = get_engine()
-        
+        payload = {"ok": False, "dialect": eng.dialect.name}
+
         try:
             with eng.begin() as conn:
                 # Ensure we are in the correct schema
                 conn.execute(text("SET search_path TO ns, public;"))
-                version = conn.exec_driver_sql("SELECT version()").scalar()
+                payload["version"] = conn.exec_driver_sql("SELECT version()").scalar()
 
                 # Counts
-                coordinates_count = conn.execute(text("SELECT COUNT(*) FROM ns.coordinates")).scalar()
-                metadata_count = conn.execute(text("SELECT COUNT(*) FROM ns.metadata")).scalar()
-                annotations_terms_count = conn.execute(text("SELECT COUNT(*) FROM ns.annotations_terms")).scalar()
+                payload["coordinates_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.coordinates")).scalar()
+                payload["metadata_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.metadata")).scalar()
+                payload["annotations_terms_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.annotations_terms")).scalar()
 
                 # Samples
-                coordinates_sample = []
                 try:
                     rows = conn.execute(text(
                         "SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z FROM ns.coordinates LIMIT 3"
                     )).mappings().all()
-                    coordinates_sample = [dict(r) for r in rows]
+                    payload["coordinates_sample"] = [dict(r) for r in rows]
                 except Exception:
-                    pass
+                    payload["coordinates_sample"] = []
 
-                metadata_sample = []
                 try:
                     rows = conn.execute(text("SELECT * FROM ns.metadata LIMIT 3")).mappings().all()
-                    metadata_sample = [dict(r) for r in rows]
+                    payload["metadata_sample"] = [dict(r) for r in rows]
                 except Exception:
-                    pass
+                    payload["metadata_sample"] = []
 
-                annotations_sample = []
                 try:
                     rows = conn.execute(text(
                         "SELECT study_id, contrast_id, term, weight FROM ns.annotations_terms LIMIT 3"
                     )).mappings().all()
-                    annotations_sample = [dict(r) for r in rows]
+                    payload["annotations_terms_sample"] = [dict(r) for r in rows]
                 except Exception:
-                    pass
+                    payload["annotations_terms_sample"] = []
 
-            # Build HTML response
-            html = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Database Connection Test</title>
-                <style>
-                    body {{
-                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-                        max-width: 1200px;
-                        margin: 40px auto;
-                        padding: 20px;
-                        background: #f5f5f5;
-                    }}
-                    .status {{
-                        background: #4caf50;
-                        color: white;
-                        padding: 20px;
-                        border-radius: 8px;
-                        margin-bottom: 20px;
-                    }}
-                    .section {{
-                        background: white;
-                        padding: 20px;
-                        margin-bottom: 20px;
-                        border-radius: 8px;
-                        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                    }}
-                    h1, h2 {{
-                        margin-top: 0;
-                    }}
-                    table {{
-                        width: 100%;
-                        border-collapse: collapse;
-                        margin-top: 10px;
-                    }}
-                    th, td {{
-                        padding: 12px;
-                        text-align: left;
-                        border-bottom: 1px solid #ddd;
-                    }}
-                    th {{
-                        background: #f8f9fa;
-                        font-weight: 600;
-                    }}
-                    .count {{
-                        font-size: 32px;
-                        font-weight: bold;
-                        color: #1976d2;
-                    }}
-                    .label {{
-                        color: #666;
-                        font-size: 14px;
-                    }}
-                    .grid {{
-                        display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                        gap: 20px;
-                        margin-bottom: 20px;
-                    }}
-                    .stat-card {{
-                        background: white;
-                        padding: 20px;
-                        border-radius: 8px;
-                        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                        text-align: center;
-                    }}
-                </style>
-            </head>
-            <body>
-                <div class="status">
-                    <h1>✓ Database Connection Successful</h1>
-                    <p><strong>PostgreSQL Version:</strong> {version[:50]}...</p>
-                </div>
-
-                <div class="grid">
-                    <div class="stat-card">
-                        <div class="count">{coordinates_count:,}</div>
-                        <div class="label">Coordinates</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="count">{metadata_count:,}</div>
-                        <div class="label">Metadata Records</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="count">{annotations_terms_count:,}</div>
-                        <div class="label">Annotation Terms</div>
-                    </div>
-                </div>
-
-                <div class="section">
-                    <h2>Sample Coordinates</h2>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Study ID</th>
-                                <th>X</th>
-                                <th>Y</th>
-                                <th>Z</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-            """
-            
-            for row in coordinates_sample:
-                html += f"""
-                            <tr>
-                                <td>{row['study_id']}</td>
-                                <td>{row['x']}</td>
-                                <td>{row['y']}</td>
-                                <td>{row['z']}</td>
-                            </tr>
-                """
-            
-            html += """
-                        </tbody>
-                    </table>
-                </div>
-
-                <div class="section">
-                    <h2>Sample Annotation Terms</h2>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Study ID</th>
-                                <th>Contrast ID</th>
-                                <th>Term</th>
-                                <th>Weight</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-            """
-            
-            for row in annotations_sample:
-                html += f"""
-                            <tr>
-                                <td>{row['study_id']}</td>
-                                <td>{row['contrast_id']}</td>
-                                <td>{row['term']}</td>
-                                <td>{row['weight']:.4f}</td>
-                            </tr>
-                """
-            
-            html += """
-                        </tbody>
-                    </table>
-                </div>
-            </body>
-            </html>
-            """
-            
-            return html
+            payload["ok"] = True
+            return jsonify(payload), 200
 
         except Exception as e:
-            error_html = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Database Error</title>
-                <style>
-                    body {{
-                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-                        max-width: 800px;
-                        margin: 40px auto;
-                        padding: 20px;
-                    }}
-                    .error {{
-                        background: #f44336;
-                        color: white;
-                        padding: 20px;
-                        border-radius: 8px;
-                    }}
-                    pre {{
-                        background: #f5f5f5;
-                        padding: 15px;
-                        border-radius: 4px;
-                        overflow-x: auto;
-                    }}
-                </style>
-            </head>
-            <body>
-                <div class="error">
-                    <h1>✗ Database Connection Failed</h1>
-                    <p><strong>Error:</strong></p>
-                    <pre>{str(e)}</pre>
-                </div>
-            </body>
-            </html>
-            """
-            return error_html, 500
+            payload["error"] = str(e)
+            return jsonify(payload), 500
 
     @app.get("/dissociate/terms/<term_a>/<term_b>", endpoint="dissociate_terms")
     def dissociate_terms(term_a, term_b):
