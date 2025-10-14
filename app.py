@@ -8,7 +8,7 @@ app = Flask(__name__)
 # Database configuration
 def get_engine():
     """Create SQLAlchemy engine from environment variable"""
-    db_url = os.environ.get('postgresql://neurosynth_backend_user:ARs3Ha51JCRJKmUULGA4VwoqqQY0cuUe@dpg-d3hoecp5pdvs73feejo0-a.oregon-postgres.render.com:5432/neurosynth_backend')
+    db_url = os.environ.get("postgresql://neurosynth_backend_user:ARs3Ha51JCRJKmUULGA4VwoqqQY0cuUe@dpg-d3hoecp5pdvs73feejo0-a.oregon-postgres.render.com/neurosynth_backend")
     if not db_url:
         raise ValueError("DB_URL environment variable not set")
     return create_engine(db_url, poolclass=NullPool)
@@ -149,11 +149,40 @@ def dissociate_by_terms(term_a, term_b):
 
 @app.route('/dissociate/locations/<coords_a>/<coords_b>')
 def dissociate_by_coordinates(coords_a, coords_b):
-    """Returns studies near coords_a but NOT near coords_b"""
+    """Returns studies near coords_a but NOT near coords_b
+    
+    Format: /dissociate/locations/{x1}_{y1}_{z1}/{x2}_{y2}_{z2}
+    Note: For negative numbers, use proper URL encoding or pass as-is
+    Example: /dissociate/locations/0_-52_26/-2_50_-6
+    """
     try:
-        # Parse coordinates
-        x1, y1, z1 = map(float, coords_a.split("_"))
-        x2, y2, z2 = map(float, coords_b.split("_"))
+        # Debug: log what we received
+        app.logger.debug(f"Received coords_a: '{coords_a}' (type: {type(coords_a).__name__})")
+        app.logger.debug(f"Received coords_b: '{coords_b}' (type: {type(coords_b).__name__})")
+        
+        # Parse coordinates - split by underscore
+        parts_a = coords_a.split("_")
+        parts_b = coords_b.split("_")
+        
+        app.logger.debug(f"Parts A: {parts_a} (length: {len(parts_a)})")
+        app.logger.debug(f"Parts B: {parts_b} (length: {len(parts_b)})")
+        
+        # Validate we have exactly 3 parts each
+        if len(parts_a) != 3:
+            raise ValueError(f"Coordinate A must have 3 values separated by underscores. Got {len(parts_a)} parts: {parts_a}")
+        if len(parts_b) != 3:
+            raise ValueError(f"Coordinate B must have 3 values separated by underscores. Got {len(parts_b)} parts: {parts_b}")
+        
+        # Convert to floats individually for better error messages
+        try:
+            x1, y1, z1 = float(parts_a[0]), float(parts_a[1]), float(parts_a[2])
+        except ValueError as e:
+            raise ValueError(f"Invalid numeric value in coordinate A '{coords_a}': {e}")
+        
+        try:
+            x2, y2, z2 = float(parts_b[0]), float(parts_b[1]), float(parts_b[2])
+        except ValueError as e:
+            raise ValueError(f"Invalid numeric value in coordinate B '{coords_b}': {e}")
         
         # Get threshold from query params or use default
         threshold = float(request.args.get('threshold', 10.0))
@@ -277,12 +306,13 @@ def dissociate_by_coordinates(coords_a, coords_b):
                 "studies": studies
             }), 200
             
-    except ValueError:
+    except ValueError as ve:
         return jsonify({
-            "error": "Invalid coordinate format. Use x_y_z with numeric values",
-            "example": "0_-52_26",
-            "coords_a": coords_a,
-            "coords_b": coords_b
+            "error": "Invalid coordinate format",
+            "message": str(ve),
+            "expected_format": "x_y_z (e.g., 0_-52_26 or -2_50_-6)",
+            "coords_a_received": coords_a,
+            "coords_b_received": coords_b
         }), 400
     except Exception as e:
         return jsonify({
